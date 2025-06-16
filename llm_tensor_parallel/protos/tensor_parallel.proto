@@ -10,10 +10,10 @@ service TensorParallelService {
 
 // Represents a tensor
 message Tensor {
-  repeated int64 dims = 1; // Dimensions of the tensor (e.g., [rows, cols])
-  repeated float data = 2;  // Flattened tensor data (row-major)
-  // For very large tensors, consider using bytes and serializing with a library like numpy/pytorch
-  // bytes serialized_data = 3;
+  repeated int64 dims = 1;     // Dimensions of the tensor (e.g., [rows, cols])
+  // repeated float data = 2;  // Flattened tensor data (row-major) - Replaced
+  bytes serialized_data = 3;   // Serialized tensor data (e.g., numpy.tobytes())
+  string dtype = 4;            // Data type of the tensor (e.g., "float32", "int64")
 }
 
 // Request for matrix multiplication

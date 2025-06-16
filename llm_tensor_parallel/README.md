@@ -1,10 +1,10 @@
 # LLM Tensor Parallelism with gRPC
 
-This project demonstrates a basic framework for large language model (LLM) inference using tensor parallelism. It distributes tensor computations (specifically matrix multiplications) across multiple remote shards using gRPC.
+This project demonstrates a framework for LLM inference using tensor parallelism, distributing tensor computations (specifically matrix multiplications for MLP layers) across multiple remote shards using gRPC. It now integrates with Hugging Face `transformers` to load and use parts of real models like GPT-2/GPT-2-XL.
 
 ## Quickstart (Local Dummy Setup)
 
-This guide will get you running a 2-shard setup locally using the dummy tensor logic.
+This guide will get you running a 2-shard setup locally using the **actual model loading and MLP sharding features** (defaulting to "gpt2" for quicker setup).
 
 1.  **Clone Repository & Navigate to Root:**
     ```bash
@@ -76,20 +76,23 @@ This guide will get you running a 2-shard setup locally using the dummy tensor l
     -   Defined in `protos/tensor_parallel.proto`.
     -   Specifies the `TensorParallelService` with methods like `ComputeMatMul`.
     -   Uses `Tensor` messages to transmit tensor data (dimensions and values).
--   **Configuration**:
-    -   `config/shard_config.json` defines the properties of each shard:
-        -   `shard_id`: Unique identifier for the shard.
-        -   `ip`: IP address of the shard.
-        -   `port`: Port on which the shard's gRPC server listens.
-        -   `slice_start`, `slice_end`: Defines the portion of the tensor this shard is responsible for.
-        -   `axis`: The axis along which the tensor is sliced (e.g., "columns", "rows").
+-   **Configuration (`config/shard_config.json`)**:
+    -   Defines `shard_id`, `ip`, `port` for network addressing.
+    -   Includes `model_name` to specify which Hugging Face model the shard should load.
+    -   `axis`, `slice_start`, `slice_end` define how each shard slices the tensors listed in its `shardeable_tensor_templates` (currently focused on MLP layers).
 
-## Current Status & Limitations (Dummy Implementation)
+## Key Features & Current Scope
 
-*   **Dummy Tensor Logic**: The current implementation uses *dummy* tensor data within the shards (`shard/shard.py`). Instead of loading slices from a real LLM (like GPT-2-XL), each shard initializes a random tensor slice. This allows testing the gRPC communication, data flow, and parallel computation logic without the overhead of actual model loading.
-*   **Matrix Multiplication Focus**: The primary parallelized operation is matrix multiplication. Other LLM layer operations (activations, normalization) are assumed to be handled by the orchestrator locally in the current simplified model.
-*   **Basic Error Handling**: Error handling is basic.
-*   **No Real Model Loading**: Full model loading (e.g., from Hugging Face Transformers) and automatic tensor slicing based on a model's architecture are not yet implemented. The orchestrator and shards currently operate on the abstract idea of tensor slices defined purely by the `shard_config.json` and the dummy data generation in `shard.py`.
+*   **Real Model Integration**: Loads actual Hugging Face models (e.g., GPT-2, GPT-2-XL) in both orchestrator and shards.
+*   **MLP Layer Sharding**: The MLP layers (`c_fc` and `c_proj` weights) within each transformer block are sharded (column-wise) across the configured shards. The orchestrator distributes the computation for these specific matrix multiplications.
+*   **Non-Sharded Operations on Orchestrator**: Embeddings, layer normalizations, residual connections, activation functions (GELU for MLP), and currently the entire attention mechanism (including QKV projection and output projection) are executed on the orchestrator. The final language model head for logits is also on the orchestrator.
+*   **Byte-based Tensor Serialization**: Uses `numpy.tobytes()` and `np.frombuffer()` for more efficient tensor data transfer via gRPC.
+*   **Basic End-to-End Inference**: Capable of generating text autoregressively for a given prompt.
+*   **Limitations**:
+    *   **Attention Sharding**: The attention mechanism's linear layers (`c_attn` for QKV, `c_proj` for output) are *not* currently sharded in the `full_inference` pipeline and run on the orchestrator. This is a key area for future sharding enhancement.
+    *   **KV Caching**: Not implemented for generation, leading to re-computation for previous tokens in each step.
+    *   **Error Handling & Robustness**: Basic; could be improved for production scenarios.
+    *   **Configuration Rigidity**: The current shard logic applies the same slicing parameters from `shard_config.json` to all predefined shardeable tensor templates. This requires careful configuration if these tensors have different shardeable dimension sizes.
 
 ## Project Structure
 
@@ -142,25 +145,21 @@ source venv/bin/activate  # On Linux/macOS
 ```
 
 ### Step 4: Install Dependencies
-The quickest way to install core dependencies for the dummy setup (orchestrator, shard, and tests) is:
+Core dependencies now include `transformers` and `torch`.
 ```bash
-pip install grpcio grpcio-tools numpy
+pip install grpcio grpcio-tools numpy transformers torch
+# (These cover requirements for orchestrator, shard, and tests)
 ```
-Alternatively, to install from requirements files (currently very similar to the above for the dummy setup):
+Alternatively, install directly from the requirements files:
 ```bash
 pip install -r orchestrator/requirements.txt
 pip install -r shard/requirements.txt
-# grpcio-tools is listed separately as it's primarily for gRPC code generation.
-# numpy is used by both orchestrator and shard, and for tests.
-```
-For development or if you need to regenerate gRPC code, ensure `grpcio-tools` is installed:
-```bash
-pip install grpcio-tools
+# Ensure grpcio-tools is installed if you need to regenerate protobuf code:
+# pip install grpcio-tools
 ```
 
 ### Step 5: Generate gRPC Code
-The repository should include pre-generated Python gRPC files in the `protos/` directory (`tensor_parallel_pb2.py`, `tensor_parallel_pb2_grpc.py`).
-However, if you modify `protos/tensor_parallel.proto` or if these files are missing, you'll need to regenerate them.
+The repository includes pre-generated Python gRPC files from `tensor_parallel.proto`. If you modify the `.proto` file, or if they are missing, regenerate them:
 
 From the `llm_tensor_parallel` root directory, run:
 ```bash
@@ -174,7 +173,7 @@ touch protos/__init__.py # For Linux/macOS
 
 ## Configuration for Sharding (`config/shard_config.json`)
 
-The `config/shard_config.json` file is central to this tensor parallelism framework. It dictates how different parts of a large tensor (conceptually, a model's weight matrix) are distributed across various shard servers and how the orchestrator can reach them.
+The `config/shard_config.json` file is central to this tensor parallelism framework. It dictates how different parts of a large tensor (from a Hugging Face model like GPT-2) are distributed across various shard servers and how the orchestrator can reach them.
 
 **Structure:**
 The file is a JSON array, where each element in the array is an object representing the configuration for a single shard.
@@ -204,45 +203,42 @@ The file is a JSON array, where each element in the array is an object represent
 **Key Fields Detailed:**
 
 *   `shard_id` (string): A unique identifier for the shard. This ID is used by the `shard.py` script (via the `SHARD_ID` environment variable) to find its specific configuration details within this JSON file.
-*   `ip` (string): The IP address or hostname that the shard server will bind to. For local testing, `"localhost"` is common. In a distributed or containerized setup, this would be the shard's reachable IP address or service name.
-*   `port` (integer): The network port on which the shard's gRPC server will listen for incoming requests from the orchestrator.
-*   `axis` (string): Specifies the dimension along which the conceptual "full tensor" is sliced.
-    *   `"columns"`: This is the primary mode supported by the current dummy implementation. It implies that the shard holds a specific range of *columns* of a larger matrix. For a weight matrix `W` in a layer `Y = XW`, each shard holds `W_i` where `W = [W_0, W_1, ..., W_n]`.
-    *   `"rows"`: While not fully demonstrated in the dummy examples for matrix multiplication (which focuses on column sharding of weights), this would imply that the shard holds a specific range of *rows*. This could be useful for other types of operations or different tensor parallelism strategies.
+*   `model_name` (string, optional): Specifies the Hugging Face model identifier (e.g., `"gpt2"`, `"gpt2-xl"`) that this shard (and the orchestrator) should load. Defaults to `"gpt2-xl"` in the shard if not provided, but it's best to be explicit.
+*   `ip` (string): The IP address or hostname that the shard server will bind to. For local testing, `"localhost"` is common.
+*   `port` (integer): The network port on which the shard's gRPC server will listen.
+*   `axis` (string): Specifies the dimension along which tensors are sliced.
+    *   `"columns"`: The primary supported mode. The shard holds a specific range of *columns* of a weight matrix. For `Y = XW`, each shard holds `W_i` where `W = [W_0, W_1, ..., W_n]`.
+    *   `"rows"`: The shard holds a specific range of *rows*.
 *   `slice_start` (integer): The starting index of the slice this shard is responsible for, along the specified `axis`.
-*   `slice_end` (integer): The ending index (exclusive) of the slice this shard is responsible for. For example, if `axis` is `"columns"`, `slice_start` is 0, and `slice_end` is 50, the shard manages columns 0 through 49.
+*   `slice_end` (integer): The ending index (exclusive) of the slice. For `axis: "columns"`, this defines columns `slice_start` through `slice_end - 1`.
 
 <!-- Diagram: Illustration of a weight matrix being column-sharded, with Input (X) going to each shard, and partial results (X @ W_slice) being returned and concatenated. -->
 
 **Scaling to N Shards:**
-To scale your distributed computation to `N` shards, you would simply add `N` objects to the JSON list in `config/shard_config.json`. Each object must have:
-1.  A unique `shard_id`.
-2.  The correct network details (`ip` and `port`) for that shard.
-3.  Carefully calculated `slice_start` and `slice_end` values to ensure the entire tensor is covered without overlaps or gaps. For example, if a weight matrix has 2048 columns and you want to distribute it across 4 shards using column-wise sharding:
-    *   Shard 0: `slice_start: 0`, `slice_end: 512`
-    *   Shard 1: `slice_start: 512`, `slice_end: 1024`
-    *   Shard 2: `slice_start: 1024`, `slice_end: 1536`
-    *   Shard 3: `slice_start: 1536`, `slice_end: 2048`
-    The `axis` for all these would be `"columns"`.
+To scale to `N` shards, add `N` objects to the JSON list. Each needs a unique `shard_id`, its network details, and correctly calculated `slice_start`/`slice_end` values for the intended sharded dimension. For example, to shard a tensor with 3072 columns (like GPT-2's `c_fc` output dimension) across 2 shards:
+*   Shard 0: `"slice_start": 0`, `"slice_end": 1536`, `"axis": "columns"`
+*   Shard 1: `"slice_start": 1536`, `"slice_end": 3072`, `"axis": "columns"`
 
-### Expectations for the Current Dummy Tensor Implementation
-It's crucial to understand how the current `shard/shard.py` (specifically its `load_tensor_slice` function) interacts with this configuration, as it uses *dummy data* rather than loading parts of a real model:
+### Tensor Slicing Notes for Real Models
+*   **Universal Slicing Parameters**: The `shard.py` script currently applies the *same* `slice_start`, `slice_end`, and `axis` from its configuration to *all* tensor names defined in its internal `shardeable_tensor_templates` list (e.g., `transformer.h.{}.mlp.c_fc.weight`, `transformer.h.{}.mlp.c_proj.weight`).
+*   **Dimension Compatibility**: It's crucial that these slicing parameters are valid for the dimensions of all tensors a shard attempts to slice according to its templates.
+    *   For example, in GPT-2, `mlp.c_fc.weight` might be `(n_embd, 4*n_embd)` and `mlp.c_proj.weight` might be `(4*n_embd, n_embd)`. If sharding both column-wise on their *output* dimension (second dimension), `c_fc` needs slices up to `4*n_embd` and `c_proj` up to `n_embd`. A single `slice_end` in `shard_config.json` might not be suitable for both if it's too large for `c_proj` or too small to fully utilize sharding for `c_fc`.
+    *   **Recommendation**: For the current implementation, it's best to tailor the `shard_config.json` and the `shardeable_tensor_templates` in `shard.py` to focus on a specific set of tensors that share the same shardeable dimension size (e.g., all `c_fc` layers, or all `c_proj` layers, if sharding them by their output columns). The integration tests, for instance, configure sharding for the `mlp.c_fc` layer's output dimension. Shards might log errors for other templates if the dimensions don't align with the config, but computation will proceed for correctly sliced tensors. Future enhancements could allow per-tensor or per-template slicing rules in the configuration.
 
-*   **Hardcoded Row Dimension (for Column Sharding):** When `axis: "columns"`, the dummy tensor slice created by `shard.py` is hardcoded to have **100 rows**.
-*   **Column Dimension from Config:** The number of columns for this dummy slice is determined by `slice_end - slice_start` from its configuration entry in `shard_config.json`. For instance, if a shard has `axis: "columns"`, `slice_start: 0`, and `slice_end: 50`, its dummy tensor slice will be of shape `(100, 50)`.
-*   **Orchestrator Compatibility:** The orchestrator's input tensor (especially in the `full_inference` dummy example or test cases) must be mathematically compatible for multiplication with these shard slices. If each shard's slice is `(100, slice_width_i)` due to column sharding, the input activation from the orchestrator must have 100 columns (features). For example, an input of shape `(batch_size, 100)` would be compatible. This is why the default orchestrator examples work with the default shard configurations. If you change the slice configurations or the hardcoded dimension in `shard.py`, you might need to adjust the orchestrator's input accordingly.
+## Running the System Locally
 
-**Suitability for Real Models (Briefly):**
-For real LLMs, column-wise sharding (where `axis: "columns"` and slices define column ranges) is a common strategy for distributing large weight matrices in feed-forward neural network layers or the dense projection layers within attention mechanisms. This is particularly effective when the inner dimension of the matrix multiplication (often denoted `K` in `A(M,K) @ W(K,N)`) is large and consistent for the input activations (`A`) and the weight matrix slices (`W_i`).
+**Important: Model Downloads & Cache**
+*   Running the system will now download the specified Hugging Face model (e.g., "gpt2" or "gpt2-xl" as defined in `config/shard_config.json` or the orchestrator's default) if it's not already cached by `transformers`. This can take significant time and disk space on the first run.
+*   To control the download location, you can set Hugging Face environment variables *before* running the scripts:
+    *   `HF_HOME`: Specifies the main directory for Hugging Face caches (e.g., `~/.cache/huggingface`).
+    *   `TRANSFORMERS_CACHE`: More specific cache for models.
+    *   `HF_DATASETS_CACHE`: For datasets, though not directly used by this project yet.
+    Example: `export HF_HOME=/path/to/my/hf_cache`
 
-## Running the System Locally (Dummy Tensor Example)
-
-This section guides you through running the system with its current dummy tensor logic. The orchestrator and shards will communicate, but tensor computations will use randomly generated data on the shards.
+This section guides you through running the system with actual model loading and sharding of MLP layers.
 
 ### Step 1: Understand the Configuration (`config/shard_config.json`)
-The `config/shard_config.json` file is crucial for defining how the tensor processing is distributed. (See the "Configuration for Sharding (`config/shard_config.json`)" section above for a detailed explanation).
-
-The default configuration in `config/shard_config.json` sets up two shards on `localhost` (ports `50051` and `50052`) for column-wise sharding. Based on the dummy tensor logic detailed in the configuration section, each shard will effectively load a tensor of shape `(100, 50)`.
+Review the "Configuration for Sharding (`config/shard_config.json`)" section above for a detailed explanation. Ensure your configuration specifies the desired `model_name` (e.g., "gpt2" for quicker tests, "gpt2-xl" for larger scale) and that `slice_start`/`slice_end`/`axis` are appropriate for the chosen model's tensor dimensions you intend to shard (primarily MLP layers' weights in the current setup).
 
 ### Step 2: Start the Shard Servers
 
@@ -298,14 +294,26 @@ The orchestrator will:
 2.  Attempt to connect to the shard servers specified.
 3.  (After a brief wait) Send a dummy input for a distributed matrix multiplication.
 4.  Print the shape of the received (concatenated) result. You should see something like:
-    `Orchestrator: Inference result: Processed output (shape: (1, 100))`
-    (The exact output dimension depends on the `slice_end` of the last shard in the config for the dummy data).
+    `Orchestrator: Generated text: 'Hello world this is a test...'` (or similar generated text).
 
-This completes a local run of the system with dummy tensor processing.
+This completes a local run of the system with real model processing.
 
 ## Running with Docker (Optional)
 
-Dockerfiles are provided for both the orchestrator (`orchestrator/Dockerfile`) and shard (`shard/Dockerfile`). These allow you to run the components in isolated containers.
+Dockerfiles are provided for both the orchestrator (`orchestrator/Dockerfile`) and shard (`shard/Dockerfile`). These allow you to run the components in isolated containers. Remember to consider model download locations and caching when using Docker.
+
+**Model Cache Volume (Recommended):**
+To persist Hugging Face model downloads across container runs and share the cache between the host and containers (or among multiple containers), mount a host directory to the container's cache location. The Dockerfiles are already configured to use `/app/.cache/huggingface` via `HF_HOME`.
+Example:
+```bash
+# On your host machine, create a directory for the cache:
+# mkdir -p ./my_hf_cache
+# (Ensure this path is absolute when using -v for clarity, or use $(pwd)/my_hf_cache)
+
+# Then, when running containers, add the volume mount:
+# -v /path/to/your/host/my_hf_cache:/app/.cache/huggingface
+```
+Ensure the `HF_HOME`, `TRANSFORMERS_CACHE`, and `HF_DATASETS_CACHE` environment variables (set in the Dockerfiles) point to this mounted path or subdirectories within it.
 
 ### 1. Build the Docker Images
 From the `llm_tensor_parallel` root directory:
@@ -358,49 +366,55 @@ Networking between Docker containers, or between a container and the host machin
     2.  **Configure Orchestrator:** The `shard_config.json` used by the orchestrator (running on the host) must then use the host's IP address (e.g., `192.168.x.x` or `host.docker.internal` if your Docker version supports it for host access from containers) and the *host ports* you mapped.
 
 ### 3. Running Shard Containers (Example with Custom Network)
-This example assumes you are using Option A with a `config/docker_shard_config.json` that uses service names, and this config is correctly placed in `/app/config/shard_config.json` inside the images (either by Dockerfile copy or mount).
+This example assumes you are using Option A (custom network), a Docker-aware `shard_config.json` (using service names like "shard0", "shard1" as IPs), and that this config is either copied into your images or mounted. Remember to include the volume mount for the cache.
 
 *   **Shard 0:**
     ```bash
     docker run -d --rm --name shard0 --network llm_network \
+      -v /path/to/host/my_hf_cache:/app/.cache/huggingface \
       -e SHARD_ID="shard0" \
       -e CONFIG_PATH="/app/config/shard_config.json" \
+      -e HF_HOME="/app/.cache/huggingface" \
       llm_shard
     ```
 *   **Shard 1:**
     ```bash
     docker run -d --rm --name shard1 --network llm_network \
+      -v /path/to/host/my_hf_cache:/app/.cache/huggingface \
       -e SHARD_ID="shard1" \
       -e CONFIG_PATH="/app/config/shard_config.json" \
+      -e HF_HOME="/app/.cache/huggingface" \
       llm_shard
     ```
-    Docker's internal DNS will resolve `shard0` and `shard1` to their respective container IPs within the `llm_network`.
+    Docker's internal DNS will resolve `shard0` and `shard1` (if used as IPs in config) within `llm_network`.
 
 ### 4. Running Orchestrator Container (Example with Custom Network)
-The orchestrator also joins the same network and uses the Docker-aware `shard_config.json`.
-
+The orchestrator joins the same network.
 ```bash
 docker run --rm --network llm_network \
+  -v /path/to/host/my_hf_cache:/app/.cache/huggingface \
   -e CONFIG_PATH="/app/config/shard_config.json" \
-  # If mounting config: -v $(pwd)/config/docker_shard_config.json:/app/config/shard_config.json
+  # If mounting a specific Docker config: -v $(pwd)/config/docker_shard_config.json:/app/config/shard_config.json
+  -e HF_HOME="/app/.cache/huggingface" \
   llm_orchestrator
 ```
-The orchestrator should now be able to connect to `shard0:50051` and `shard1:50052`.
+The orchestrator should connect to shards using their service names (e.g., `shard0:50051`).
 
 **Important Notes for Docker:**
-*   The `CONFIG_PATH` environment variable inside the containers is set to `/app/config/shard_config.json` as per the Dockerfiles. Ensure the correct version of the config file is present at this path inside the running containers.
-*   Always check container logs (`docker logs <container_name>`) if you encounter connection issues.
+*   **Configuration File:** The `CONFIG_PATH` inside containers is `/app/config/shard_config.json`. Ensure the correct (Docker-network-aware) version of this file is present at that path, either by being `COPY`ed in the Dockerfile or mounted with `-v`.
+*   **Cache Consistency**: Using the same mounted cache volume for all containers (orchestrator and shards) ensures models are downloaded only once.
+*   **Logs**: Always check container logs (`docker logs <container_name>`) for issues.
 
 ## Running Tests
 
 From the `llm_tensor_parallel` root directory:
 
 ```bash
-# Ensure test dependencies are installed (e.g. from a requirements_dev.txt or manually)
-# pip install ... (numpy, grpcio are needed for tests)
+# Ensure test dependencies are installed (transformers, torch, etc.)
+# pip install -r orchestrator/requirements.txt # (or a combined test_requirements.txt)
 python -m unittest discover tests
 ```
-This will run all unit and integration tests. Integration tests will start and stop shard subprocesses automatically.
+This will run all unit and integration tests. Integration tests now use the "gpt2" model by default and will download it if not cached (respecting `HF_HOME` if set in the test execution environment).
 
 ## Troubleshooting / FAQ
 

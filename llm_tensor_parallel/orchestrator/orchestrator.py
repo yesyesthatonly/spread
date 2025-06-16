@@ -3,6 +3,10 @@ import numpy as np
 import json # For loading shard configuration
 import os
 
+# Import Hugging Face libraries
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
 # Import generated gRPC classes
 from protos import tensor_parallel_pb2
 from protos import tensor_parallel_pb2_grpc
@@ -24,22 +28,71 @@ class Orchestrator:
     - Aggregating results from shards to form the final output for a layer.
     - (Future) Handling the overall LLM inference pipeline, including tokenization and model layer management.
     """
-    def __init__(self, config_path=CONFIG_PATH):
+    def __init__(self, config_path=CONFIG_PATH, model_name="gpt2-xl"):
         """
         Initializes the Orchestrator.
 
         Args:
             config_path (str): Path to the shard configuration JSON file.
+            model_name (str): Name of the Hugging Face model to load (e.g., "gpt2", "gpt2-xl").
         """
         self.shard_stubs = {}  # Dictionary to store gRPC stubs, keyed by shard_id
         self.shard_configs = [] # List to store configurations of all shards
         self._load_config(config_path)
         self._connect_to_shards()
 
-        # Placeholder for future components like tokenizer and model architecture details.
-        # self.tokenizer = None  # E.g., Hugging Face tokenizer
-        # self.model_layers_config = [] # Configuration describing how model tensors are structured/sharded.
-        # Example: self.load_model_tokenizer("gpt2-xl") # To be implemented
+        self.model_name = model_name
+        self.model = None
+        self.tokenizer = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._load_model_and_tokenizer() # Load model and tokenizer
+        if self.model: # If model was loaded successfully
+            self.model.to(self.device) # Move model to the chosen device
+
+        # self.model_layers_config = [] # This might be used later for layer-specific logic
+
+    def _load_model_and_tokenizer(self):
+        """
+        Loads the Hugging Face model and tokenizer specified by `self.model_name`.
+        Sets `self.model` and `self.tokenizer` attributes.
+        """
+        print(f"Orchestrator: Loading model and tokenizer for '{self.model_name}'...")
+        try:
+            # Device selection:
+            # For now, the orchestrator primarily manages and distributes work.
+            # If it were to run some layers itself (e.g., embedding layer, final output layer),
+            # moving the model (or parts of it) to CUDA would be beneficial if available.
+            # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+
+            # Add padding token if it doesn't exist (common for GPT-2 models)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                # If we were fine-tuning, we might also need to update model.config:
+                # self.model.config.pad_token_id = self.tokenizer.pad_token_id
+
+            # Load the pre-trained model.
+            # In a highly memory-optimized scenario for extremely large models,
+            # the orchestrator might only load the model's architecture or metadata here.
+            # Shards would then be responsible for loading their respective weight slices.
+            # However, for models like GPT-2-XL, loading the full model on the orchestrator
+            # is often feasible and simplifies handling of non-sharded layers (e.g., embeddings, LayerNorm).
+            self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
+            # self.model.to(self.device) # Move model to the selected device if orchestrator runs parts of it
+            self.model.eval() # Set the model to evaluation mode (disables dropout, etc.)
+
+            print(f"Orchestrator: Model '{self.model_name}' and tokenizer loaded successfully.")
+
+            # Optional: Print model structure or specific parameter details for debugging.
+            # print("Model Config:", self.model.config)
+            # print(f"Tokenizer pad token: {self.tokenizer.pad_token}, ID: {self.tokenizer.pad_token_id}")
+            # print(f"Model pad token ID: {self.model.config.pad_token_id}")
+
+        except Exception as e:
+            print(f"Orchestrator: Error loading model or tokenizer for '{self.model_name}': {e}")
+            # This is a critical failure, so re-raise to stop orchestrator initialization.
+            raise
 
     def _load_config(self, config_path):
         """
@@ -102,8 +155,9 @@ class Orchestrator:
             tensor_parallel_pb2.Tensor: The protobuf Tensor message.
         """
         return tensor_parallel_pb2.Tensor(
-            dims=list(numpy_array.shape),       # Set tensor dimensions
-            data=numpy_array.flatten().tolist() # Flatten data and convert to list for protobuf
+            dims=list(numpy_array.shape),
+            serialized_data=numpy_array.tobytes(), # Use tobytes()
+            dtype=str(numpy_array.dtype)          # Store dtype as string
         )
 
     def _process_output_tensor(self, tensor_proto):
@@ -117,10 +171,11 @@ class Orchestrator:
             np.ndarray: The deserialized tensor as a NumPy array.
         """
         dims = list(tensor_proto.dims)
-        data = np.array(tensor_proto.data, dtype=np.float32).reshape(dims)
+        dtype = np.dtype(tensor_proto.dtype) # Convert string back to numpy dtype
+        data = np.frombuffer(tensor_proto.serialized_data, dtype=dtype).reshape(dims)
         return data
 
-    def run_inference_layer_matmul(self, input_numpy_array, layer_id="layer_0"):
+    def run_inference_layer_matmul(self, input_numpy_array, layer_id="layer_0", tensor_name_for_shards=None):
         """
         Performs a distributed matrix multiplication for one layer.
 
@@ -147,86 +202,172 @@ class Orchestrator:
             return None
 
         # Serialize the input NumPy array to a protobuf Tensor message for gRPC.
+        # The following is the existing code for run_inference_layer_matmul, with the tensor_name highlighted.
+        print(f"Orchestrator: Running matmul for {layer_id} (tensor: {tensor_name_for_shards}) with input shape {input_numpy_array.shape}")
+        if not self.shard_stubs:
+            print("Orchestrator: No shards connected.")
+            return None
+
         input_tensor_proto = self._prepare_input_tensor(input_numpy_array)
+        results_from_shards = []
 
-        results_from_shards = [] # List to store {"shard_id": id, "output_slice": np.array} dicts
-
-        # Iterate over available shard stubs and send the ComputeMatMul request.
         for shard_id, stub in self.shard_stubs.items():
-            print(f"Orchestrator: Sending input to shard {shard_id} for {layer_id}...")
+            print(f"Orchestrator: Sending input to shard {shard_id} for {layer_id} (tensor: {tensor_name_for_shards})...")
             try:
-                # Create the gRPC request message.
                 request = tensor_parallel_pb2.ComputeRequest(
                     input_tensor=input_tensor_proto,
-                    # model_name="gpt2-xl", # Optional: Can be used by shards to select model-specific logic
-                    # tensor_name=f"{layer_id}_weights" # Optional: Can identify the specific tensor/layer
+                    model_name=self.model_name,
+                    tensor_name=tensor_name_for_shards # Ensure this is passed
                 )
-                # Make the RPC call to the shard's ComputeMatMul method with a timeout.
-                response = stub.ComputeMatMul(request, timeout=10) # 10-second timeout
-
-                # Deserialize the received output slice (protobuf Tensor) back to a NumPy array.
+                # Increased timeout for potentially larger computations
+                response = stub.ComputeMatMul(request, timeout=30)
                 output_slice = self._process_output_tensor(response.output_tensor)
-                results_from_shards.append({"shard_id": shard_id, "output_slice": output_slice})
+                # Store slice_start along with the result for robust sorting
+                results_from_shards.append({
+                    "shard_id": shard_id,
+                    "output_slice": output_slice,
+                    "slice_start": next(s_conf["slice_start"] for s_conf in self.shard_configs if s_conf["shard_id"] == shard_id)
+                })
                 print(f"Orchestrator: Received output slice from {shard_id} of shape {output_slice.shape}")
-
             except grpc.RpcError as e:
-                # Handle gRPC errors (e.g., shard unavailable, computation error on shard).
-                print(f"Orchestrator: Error calling ComputeMatMul on shard {shard_id}: {e.code()} - {e.details()}")
-                # Current simple error handling: if any shard fails, the whole operation fails.
-                # More advanced strategies could include retries or partial results.
+                print(f"Orchestrator: Error calling ComputeMatMul on shard {shard_id} for tensor {tensor_name_for_shards}: {e}")
                 return None
 
         if not results_from_shards:
-            print("Orchestrator: No results received from any shards.")
+            print(f"Orchestrator: No results received from shards for {tensor_name_for_shards}.")
             return None
 
-        # Order the received slices correctly before concatenation.
-        # The order is determined by `slice_start` in the shard configuration.
-        # This ensures that slices like [A@W_0, A@W_1, A@W_2] are combined in the correct order.
-
-        # Create a map of shard_id to its output slice for easy lookup.
-        shard_output_map = {res["shard_id"]: res["output_slice"] for res in results_from_shards}
-
-        # Sort the original shard configurations by their `slice_start` value.
-        # This defines the canonical order for assembling the final tensor.
-        sorted_shards_info = sorted(self.shard_configs, key=lambda s_conf: s_conf["slice_start"])
-
-        ordered_slices = []
-        for s_info in sorted_shards_info:
-            s_id = s_info["shard_id"]
-            if s_id in shard_output_map:
-                ordered_slices.append(shard_output_map[s_id])
-            else:
-                # This indicates a shard listed in the config did not return a result (or failed).
-                # If strict completion is required, this should be an error.
-                # For now, it prints a warning. If the earlier loop returned None on error, this path might not be hit.
-                print(f"Warning: Orchestrator - No output found for shard {s_id} which was in the configuration. It might have failed.")
-                # Depending on policy, might need to return None here if a shard is missing.
-                # For now, we proceed with available slices. If this leads to an empty list, it's handled below.
+        # Sort results by slice_start to ensure correct concatenation order
+        results_from_shards.sort(key=lambda res: res["slice_start"])
+        ordered_slices = [res["output_slice"] for res in results_from_shards]
 
         if not ordered_slices:
-            print("Orchestrator: No ordered slices available for concatenation (all shards might have failed or returned no data).")
+            print(f"Orchestrator: No ordered slices to concatenate for {tensor_name_for_shards}.")
             return None
 
-        # Concatenate the ordered slices.
-        # For column-wise sharding of weights (W = [W0 W1 W2]), outputs (A*W0, A*W1, A*W2)
-        # should be concatenated along axis 1 (columns) to reconstruct the full A*W.
         try:
+            # Assuming column-wise sharding of weights, concatenate along axis 1 (columns)
             final_result = np.concatenate(ordered_slices, axis=1)
-            print(f"Orchestrator: Concatenated result shape: {final_result.shape}")
+            print(f"Orchestrator: Concatenated result for {tensor_name_for_shards}, shape: {final_result.shape}")
             return final_result
         except ValueError as e:
-            # This can happen if slices have incompatible shapes for concatenation along axis 1.
-            print(f"Orchestrator: Error concatenating result slices: {e}")
-            for i, s_arr in enumerate(ordered_slices):
-                print(f"  Slice {i} (from shard {sorted_shards_info[i]['shard_id'] if i < len(sorted_shards_info) else 'N/A'}) shape: {s_arr.shape}")
+            print(f"Orchestrator: Error concatenating results for {tensor_name_for_shards}: {e}")
+            for i, s_info in enumerate(results_from_shards): # Use results_from_shards for shard_id here
+                print(f"  Shard {s_info['shard_id']} (start: {s_info['slice_start']}) slice shape: {s_info['output_slice'].shape}")
             return None
 
+    def full_inference(self, text_input, max_length=50):
+        if not self.model or not self.tokenizer:
+            print("Orchestrator: Model or tokenizer not loaded.")
+            return "Error: Model not loaded."
 
-    def full_inference(self, text_input):
+        print(f"Orchestrator: Running full inference for input: '{text_input}'")
+
+        # 1. Tokenize Input
+        inputs = self.tokenizer(text_input, return_tensors="pt", padding=True)
+        input_ids = inputs.input_ids.to(self.device)
+
+        generated_ids = input_ids.clone()
+
+        for _ in range(max_length): # Loop to generate tokens up to max_length
+            current_input_ids = generated_ids
+
+            # 2. Get initial embeddings (non-sharded on orchestrator)
+            current_sequence_length = current_input_ids.shape[-1]
+            position_ids = torch.arange(0, current_sequence_length, dtype=torch.long, device=self.device)
+            position_ids = position_ids.unsqueeze(0)
+
+            hidden_states = self.model.transformer.wte(current_input_ids) + self.model.transformer.wpe(position_ids)
+            hidden_states = self.model.transformer.drop(hidden_states) # Apply dropout
+
+            # 3. Iterate Through Model Layers (Transformer Blocks)
+            for i, block in enumerate(self.model.transformer.h):
+                print(f"Orchestrator: Processing Layer {i}")
+
+                # Layer Norm 1 (Non-sharded)
+                ln_1_out = block.ln_1(hidden_states)
+
+                # Attention Block - Currently NON-SHARDED on Orchestrator for simplicity
+                # In a future step, QKV projection (c_attn) and output projection (c_proj)
+                # within the attention block could be sharded.
+                # For now, the whole attention block runs on the orchestrator.
+                attn_outputs = block.attn(ln_1_out, use_cache=False)
+                attn_output = attn_outputs[0]
+
+                # Residual Connection 1
+                hidden_states = hidden_states + attn_output
+
+                # Layer Norm 2 (Non-sharded)
+                ln_2_out = block.ln_2(hidden_states)
+
+                # MLP Block (c_fc and c_proj ARE SHARDED)
+                # MLP First Linear Layer (c_fc)
+                mlp_fc_tensor_name = f"transformer.h.{i}.mlp.c_fc.weight"
+
+                batch_size, seq_len, hidden_size = ln_2_out.shape # Get current shapes
+                ln_2_out_reshaped_np = ln_2_out.view(-1, hidden_size).cpu().numpy()
+
+                mlp_fc_sharded_output_np = self.run_inference_layer_matmul(
+                    ln_2_out_reshaped_np,
+                    layer_id=f"layer_{i}_mlp_fc",
+                    tensor_name_for_shards=mlp_fc_tensor_name
+                )
+                if mlp_fc_sharded_output_np is None:
+                    return f"Error: Sharded MatMul failed for MLP FC at layer {i}."
+
+                mlp_fc_bias = self.model.transformer.h[i].mlp.c_fc.bias.data.cpu().numpy()
+                mlp_fc_with_bias_np = mlp_fc_sharded_output_np + mlp_fc_bias
+
+                # GELU Activation (Non-sharded)
+                mlp_activated_torch = torch.nn.functional.gelu(
+                    torch.from_numpy(mlp_fc_with_bias_np), approximate="tanh"
+                ).to(self.device)
+
+                # MLP Second Linear Layer (c_proj)
+                mlp_proj_tensor_name = f"transformer.h.{i}.mlp.c_proj.weight"
+                mlp_activated_np = mlp_activated_torch.cpu().numpy() # Already effectively reshaped
+
+                mlp_proj_sharded_output_np = self.run_inference_layer_matmul(
+                    mlp_activated_np,
+                    layer_id=f"layer_{i}_mlp_proj",
+                    tensor_name_for_shards=mlp_proj_tensor_name
+                )
+                if mlp_proj_sharded_output_np is None:
+                    return f"Error: Sharded MatMul failed for MLP Proj at layer {i}."
+
+                mlp_proj_bias = self.model.transformer.h[i].mlp.c_proj.bias.data.cpu().numpy()
+                mlp_proj_with_bias_np = mlp_proj_sharded_output_np + mlp_proj_bias
+
+                mlp_output_torch = torch.from_numpy(mlp_proj_with_bias_np).view(batch_size, seq_len, hidden_size).to(self.device)
+
+                # Residual Connection 2
+                hidden_states = hidden_states + mlp_output_torch
+
+            # After all transformer blocks, apply final Layer Norm (Non-sharded)
+            hidden_states = self.model.transformer.ln_f(hidden_states)
+
+            # 4. Get Logits (Non-sharded) for the last token
+            logits = self.model.lm_head(hidden_states[:, -1, :])
+
+            # 5. Generate Next Token ID (Greedy decoding, Non-sharded)
+            next_token_id = torch.argmax(logits, dim=-1).unsqueeze(-1)
+
+            # 6. Append to generated_ids and check for EOS
+            generated_ids = torch.cat((generated_ids, next_token_id), dim=1)
+
+            if next_token_id.item() == self.tokenizer.eos_token_id:
+                print("Orchestrator: EOS token generated.")
+                break
+
+        # 7. Detokenize Output
+        output_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        print(f"Orchestrator: Generated text: '{output_text}'")
+        return output_text
+
+
+    def full_inference_old_placeholder(self, text_input):
         """
         Placeholder for a full LLM inference pipeline.
-
         In a complete system, this would involve:
         1. Tokenization of `text_input`.
         2. Passing token embeddings through multiple model layers.
@@ -240,7 +381,7 @@ class Orchestrator:
         Returns:
             str: The generated text result (currently a dummy string indicating output shape).
         """
-        print(f"Orchestrator: Received text input for full_inference: '{text_input}'")
+        print(f"Orchestrator: Received text input for full_inference_old_placeholder: '{text_input}'") # Renamed
 
         # DUMMY IMPLEMENTATION:
         # Simulates processing for one layer using a randomly generated input activation.
@@ -252,7 +393,12 @@ class Orchestrator:
         print(f"Orchestrator: Using DUMMY input activation of shape {dummy_input_activation.shape} for one layer.")
 
         # Call the distributed matrix multiplication for this dummy layer.
-        layer_output = self.run_inference_layer_matmul(dummy_input_activation, layer_id="dummy_llm_layer_1")
+        # Need to provide tensor_name_for_shards if this were to call the updated run_inference_layer_matmul
+        layer_output = self.run_inference_layer_matmul(
+            dummy_input_activation,
+            layer_id="dummy_llm_layer_1",
+            tensor_name_for_shards="placeholder_tensor_name" # Add a placeholder name
+        )
 
         if layer_output is not None:
             # In a real scenario, `layer_output` would feed into the next LLM layer.

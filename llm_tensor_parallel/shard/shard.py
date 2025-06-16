@@ -1,199 +1,250 @@
 import grpc
-from concurrent import futures # For creating a thread pool for the server
+from concurrent import futures
 import time
 import numpy as np
 import json
 import os
 
+# Import Hugging Face libraries
+from transformers import AutoModelForCausalLM
+import torch
+
 # Import generated gRPC classes
 from protos import tensor_parallel_pb2
 from protos import tensor_parallel_pb2_grpc
 
-# Global variable to store this shard's tensor slice.
-# In a more complex application, this might be part of a class or a more sophisticated cache.
-TENSOR_SLICE = None
-# SHARD_ID is obtained from environment variable, defaulting to "shard0".
-# This ID is used to find this shard's specific configuration in the config file.
-SHARD_ID = os.environ.get("SHARD_ID", "shard0")
-# CONFIG_PATH is obtained from environment variable, defaulting to a relative path.
-# This JSON file contains connection info and slicing details for all shards.
-CONFIG_PATH = os.environ.get("CONFIG_PATH", "../config/shard_config.json")
-
-def load_tensor_slice(shard_id, config_path, model_name="gpt2-xl", tensor_name_key="some_tensor_key"):
-    """
-    Loads a tensor slice for this shard based on its ID and configuration.
-
-    Args:
-        shard_id (str): The unique identifier for this shard.
-        config_path (str): Path to the JSON configuration file.
-        model_name (str, optional): Name of the model (for future use with real model loading).
-        tensor_name_key (str, optional): Key to identify a specific tensor (for future use).
-
-    This is currently a DUMMY IMPLEMENTATION. It generates a random tensor slice
-    based on parameters found in the config file for this shard_id.
-    In a real system, this function would load a part of a real model's tensor.
-    """
-    global TENSOR_SLICE # Modifies the global TENSOR_SLICE variable
-
-    # This is a placeholder for actual model loading and slicing.
-    # Steps for a real implementation:
-    # 1. Read `config_path` to find this shard's specific info (e.g., slice_start, slice_end, axis).
-    # 2. Load the specified model (e.g., `model_name` from Hugging Face Transformers).
-    # 3. Extract the relevant tensor (e.g., a weight matrix identified by `tensor_name_key`).
-    # 4. Slice this tensor according to this shard's configuration.
-    # 5. Store the resulting slice in the global `TENSOR_SLICE`.
-
-    print(f"Shard {shard_id}: Loading tensor slice (dummy implementation)...")
-    try:
-        # Attempt to read the main configuration file
-        with open(config_path, 'r') as f:
-            config = json.load(f) # `config` is a list of shard configurations
-
-        # Find the specific configuration for this shard_id
-        shard_config = next((s_conf for s_conf in config if s_conf["shard_id"] == shard_id), None)
-
-        if shard_config:
-            slice_start = shard_config["slice_start"]
-            slice_end = shard_config["slice_end"]
-
-            # For this dummy implementation, we define a fixed dimension for the "model's full tensor"
-            # If sharding by columns, this is the number of rows.
-            # If sharding by rows, this is the number of columns.
-            # This value (100) must be consistent with the orchestrator's dummy input.
-            common_dimension_size = 100
-
-            if shard_config["axis"] == "columns":
-                # When sharding by columns, the slice is tensor[:, slice_start:slice_end]
-                # So, the number of rows is `common_dimension_size`, and columns is `slice_end - slice_start`.
-                TENSOR_SLICE = np.random.rand(common_dimension_size, slice_end - slice_start).astype(np.float32)
-            elif shard_config["axis"] == "rows":
-                # When sharding by rows, the slice is tensor[slice_start:slice_end, :]
-                # So, the number of rows is `slice_end - slice_start`, and columns is `common_dimension_size`.
-                TENSOR_SLICE = np.random.rand(slice_end - slice_start, common_dimension_size).astype(np.float32)
-            else:
-                # Invalid axis configuration
-                raise ValueError(f"Unknown axis for sharding: {shard_config['axis']}")
-
-            print(f"Shard {shard_id}: Loaded DUMMY tensor slice of shape {TENSOR_SLICE.shape} for axis '{shard_config['axis']}' (indices {slice_start} to {slice_end}).")
-        else:
-            # Configuration for this specific shard_id was not found.
-            print(f"Shard {shard_id}: Configuration not found in {config_path}.")
-            # Fallback to a default small random tensor if no specific config is found.
-            TENSOR_SLICE = np.random.rand(10,10).astype(np.float32)
-
-    except Exception as e:
-        # Catch any errors during loading (e.g., file not found, JSON parsing error)
-        print(f"Error loading tensor slice for shard {shard_id}: {e}")
-        # Fallback to a default small random tensor in case of error.
-        TENSOR_SLICE = np.random.rand(10,10).astype(np.float32)
-
+# SHARD_ID and CONFIG_PATH are now read within the Servicer's initialization
+# SHARD_ID = os.environ.get("SHARD_ID", "shard0")
+# CONFIG_PATH = os.environ.get("CONFIG_PATH", "../config/shard_config.json")
 
 class TensorParallelServiceServicer(tensor_parallel_pb2_grpc.TensorParallelServiceServicer):
     """
     gRPC service implementation for tensor parallelism.
     This class handles incoming RPC calls defined in tensor_parallel.proto.
+    It now loads specified layers of a Hugging Face model and serves slices of them.
     """
+    def __init__(self):
+        """
+        Initializes the servicer, loading the model and tensor slices.
+        """
+        self.tensor_slices_cache = {} # Cache for storing tensor slices
+        self.model = None             # Will hold the loaded Hugging Face model
+        self.shard_id = None          # Will be set from ENV
+        self.shard_config = None      # Will be loaded from config file
+        self._initialize_shard()      # Load model and tensor slices
+
+    def _initialize_shard(self):
+        """
+        Loads the shard's configuration, the specified Hugging Face model,
+        and extracts the necessary tensor slices based on the configuration.
+        """
+        self.shard_id = os.environ.get("SHARD_ID", "shard0")
+        config_path = os.environ.get("CONFIG_PATH", "../config/shard_config.json")
+
+        print(f"Shard {self.shard_id}: Initializing...")
+        try:
+            with open(config_path, 'r') as f:
+                all_configs = json.load(f)
+            self.shard_config = next((s_conf for s_conf in all_configs if s_conf["shard_id"] == self.shard_id), None)
+
+            if not self.shard_config:
+                error_msg = f"Configuration for shard {self.shard_id} not found in {config_path}."
+                print(f"Shard {self.shard_id}: {error_msg}")
+                raise ValueError(error_msg)
+        except Exception as e:
+            print(f"Shard {self.shard_id}: Error loading shard configuration from {config_path}: {e}")
+            raise # Critical failure if config cannot be loaded
+
+        # Get model_name from shard_config, defaulting to "gpt2-xl"
+        # This allows different sets of shards to potentially serve different models or versions.
+        model_name = self.shard_config.get("model_name", "gpt2-xl")
+        print(f"Shard {self.shard_id}: Loading model '{model_name}' for tensor slicing.")
+
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(model_name)
+            self.model.eval() # Set model to evaluation mode (disables dropout, etc.)
+            print(f"Shard {self.shard_id}: Model '{model_name}' loaded successfully.")
+        except Exception as e:
+            print(f"Shard {self.shard_id}: Error loading model '{model_name}': {e}")
+            raise # Critical failure if model cannot be loaded
+
+        self._load_all_tensor_slices()
+
+    def _load_all_tensor_slices(self):
+        """
+        Extracts and caches tensor slices from the loaded model based on shard_config.
+        Populates `self.tensor_slices_cache`.
+        """
+        print(f"Shard {self.shard_id}: Preparing to load tensor slices...")
+        if not self.model:
+            print(f"Shard {self.shard_id}: Model not loaded. Cannot load slices.")
+            # This should ideally not happen if _initialize_shard succeeded.
+            return
+
+        slice_start = self.shard_config["slice_start"]
+        slice_end = self.shard_config["slice_end"]
+        axis = self.shard_config["axis"] # Expected "columns" or "rows"
+
+        # Determine the number of layers from the model's configuration
+        # (e.g., for GPT-2, this is `n_layer`)
+        num_layers = self.model.config.n_layer
+
+        # Define templates for names of tensors that are typically sharded in GPT-like models.
+        # These templates correspond to weights in attention blocks and MLP blocks.
+        shardeable_tensor_templates = [
+            "transformer.h.{}.attn.c_attn.weight",  # Attention (Query, Key, Value projection) weights
+            # "transformer.h.{}.attn.c_attn.bias",  # Corresponding biases (can also be sharded)
+            "transformer.h.{}.attn.c_proj.weight", # Attention output projection weights
+            "transformer.h.{}.mlp.c_fc.weight",    # MLP feed-forward layer weights
+            "transformer.h.{}.mlp.c_proj.weight",   # MLP projection layer weights
+        ]
+
+        # In a more comprehensive setup, one might also shard:
+        # - "transformer.wte.weight" (Word Token Embeddings)
+        # - "lm_head.weight" (Language Model Head - often tied/shared with wte.weight)
+        # Sharding these would depend on vocabulary size and chosen sharding strategy (e.g., row-wise).
+
+        named_parameters = dict(self.model.named_parameters())
+
+        for i in range(num_layers): # Iterate through each layer of the model
+            for template in shardeable_tensor_templates:
+                tensor_name = template.format(i) # Construct specific tensor name for the layer
+
+                if tensor_name in named_parameters:
+                    full_tensor = named_parameters[tensor_name].data # Get the tensor data
+
+                    # Detach tensor from computation graph and move to CPU for slicing.
+                    # This ensures we are working with a plain tensor and not affecting gradients.
+                    full_tensor = full_tensor.detach().cpu()
+
+                    sliced_tensor_part = None
+                    if axis == "columns":
+                        # Column-wise sharding: tensor is sliced along its second dimension (columns).
+                        # Example: For a weight matrix (K, N), a slice is (K, N_slice).
+                        sliced_tensor_part = full_tensor[:, slice_start:slice_end]
+                    elif axis == "rows":
+                        # Row-wise sharding: tensor is sliced along its first dimension (rows).
+                        # Example: For a weight matrix (K, N), a slice is (K_slice, N).
+                        sliced_tensor_part = full_tensor[slice_start:slice_end, :]
+                    else:
+                        print(f"Shard {self.shard_id}: Unknown axis '{axis}' for tensor {tensor_name}. Skipping slicing for this tensor.")
+                        continue # Skip if axis configuration is not recognized
+
+                    # Store the slice as a NumPy array in the cache.
+                    # NumPy is used here for consistency with the existing MatMul implementation,
+                    # but slices could also be kept as PyTorch tensors.
+                    self.tensor_slices_cache[tensor_name] = sliced_tensor_part.numpy()
+                    print(f"Shard {self.shard_id}: Loaded slice for {tensor_name} with shape {self.tensor_slices_cache[tensor_name].shape}")
+                else:
+                    print(f"Shard {self.shard_id}: Tensor {tensor_name} not found in the loaded model. Skipping.")
+
+        # Example for sharding embeddings (if configured, not fully implemented here)
+        # if self.shard_config.get("shard_embeddings", False):
+        #     wte_name = "transformer.wte.weight"
+        #     if wte_name in named_parameters:
+        #         # Add logic for wte sharding, likely row-wise based on vocab size distribution
+        #         pass
+
+        if not self.tensor_slices_cache:
+            print(f"Shard {self.shard_id}: WARNING - No tensor slices were loaded into cache. "
+                  f"Check shard configuration (slice_start/end, axis), model structure ('{model_name}'), "
+                  f"and shardeable_tensor_templates list in shard.py.")
+        else:
+            print(f"Shard {self.shard_id}: Finished loading {len(self.tensor_slices_cache)} tensor slices into cache.")
+
+
     def ComputeMatMul(self, request, context):
         """
-        Computes a matrix multiplication slice.
-        Input tensor is multiplied by this shard's TENSOR_SLICE.
+        Computes a matrix multiplication using a specific tensor slice requested by the client.
         """
-        print(f"Shard {SHARD_ID}: Received ComputeMatMul request.")
+        requested_tensor_name = request.tensor_name # Name of the tensor slice to use (e.g., "transformer.h.0.attn.c_attn.weight")
 
-        # Check if the tensor slice has been loaded
-        if TENSOR_SLICE is None:
-            print(f"Shard {SHARD_ID}: Error - Tensor slice not loaded.")
-            # Report an error to the gRPC client (orchestrator)
-            context.abort(grpc.StatusCode.FAILED_PRECONDITION, "Tensor slice not loaded.")
-            return tensor_parallel_pb2.ComputeResponse() # Return empty response
+        print(f"Shard {self.shard_id}: Received ComputeMatMul request for tensor '{requested_tensor_name}'.")
+
+        # Check if the requested tensor slice is in this shard's cache
+        if not requested_tensor_name or requested_tensor_name not in self.tensor_slices_cache:
+            error_msg = f"Tensor slice for '{requested_tensor_name}' not found on shard {self.shard_id}. Available slices: {list(self.tensor_slices_cache.keys())}"
+            print(f"Shard {self.shard_id}: {error_msg}")
+            context.abort(grpc.StatusCode.NOT_FOUND, error_msg)
+            return tensor_parallel_pb2.ComputeResponse()
+
+        current_tensor_slice = self.tensor_slices_cache[requested_tensor_name]
 
         input_tensor_proto = request.input_tensor
-
-        # Deserialize the input tensor from protobuf message to a NumPy array
-        # The protobuf Tensor message stores dimensions and flattened data.
         input_dims = list(input_tensor_proto.dims)
+        input_dtype = np.dtype(input_tensor_proto.dtype) # Get dtype
         try:
-            input_data = np.array(input_tensor_proto.data, dtype=np.float32).reshape(input_dims)
+            # Deserialize input tensor from protobuf message to NumPy array
+            input_data = np.frombuffer(input_tensor_proto.serialized_data, dtype=input_dtype).reshape(input_dims)
         except ValueError as e:
-            error_msg = f"Shard {SHARD_ID}: Error deserializing input tensor: {e}. Received dims: {input_dims}, data length: {len(input_tensor_proto.data)}"
+            error_msg = f"Error deserializing input tensor on shard {self.shard_id} for tensor {requested_tensor_name}: {e}. Dims: {input_dims}, dtype: {input_dtype}, expected size from dims: {np.prod(input_dims) * input_dtype.itemsize}, actual_data_len: {len(input_tensor_proto.serialized_data)}"
             print(error_msg)
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, error_msg)
             return tensor_parallel_pb2.ComputeResponse()
 
-        print(f"Shard {SHARD_ID}: Input tensor shape: {input_data.shape}, Local slice shape: {TENSOR_SLICE.shape}")
+        print(f"Shard {self.shard_id}: Input tensor shape: {input_data.shape}, Slice for '{requested_tensor_name}' shape: {current_tensor_slice.shape}")
 
-        # Perform the matrix multiplication: result = input_data @ TENSOR_SLICE
-        # This assumes TENSOR_SLICE is the right-hand matrix (e.g., a weight slice W_i)
-        # and input_data is the activation matrix (A).
-        # If W is column-sharded (axis="columns"), then TENSOR_SLICE is W_i.
-        # The operation is A @ W_i, resulting in a slice of the output activation.
+        # Perform matrix multiplication: result = input_data @ current_tensor_slice
         try:
-            result_data = np.matmul(input_data, TENSOR_SLICE)
+            result_data = np.matmul(input_data, current_tensor_slice)
         except ValueError as e:
-            # This typically occurs if matrix dimensions are incompatible for multiplication.
-            error_msg = f"Matrix multiplication error on shard {SHARD_ID}: {e}. Input shape {input_data.shape}, Slice shape {TENSOR_SLICE.shape}"
+            error_msg = (f"Matrix multiplication error on shard {self.shard_id} for tensor '{requested_tensor_name}': {e}. "
+                         f"Input shape {input_data.shape}, Slice shape {current_tensor_slice.shape}")
             print(error_msg)
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, error_msg)
             return tensor_parallel_pb2.ComputeResponse()
 
-        print(f"Shard {SHARD_ID}: Computation complete. Result slice shape: {result_data.shape}")
+        print(f"Shard {self.shard_id}: Computation for '{requested_tensor_name}' complete. Result shape: {result_data.shape}")
 
-        # Serialize the output tensor slice from NumPy array to protobuf message
+        # Serialize output tensor slice from NumPy array to protobuf message
         output_tensor_proto = tensor_parallel_pb2.Tensor(
             dims=list(result_data.shape),
-            data=result_data.flatten().tolist() # Flatten data for protobuf's repeated float field
+            serialized_data=result_data.tobytes(), # Use tobytes()
+            dtype=str(result_data.dtype)           # Store dtype as string
         )
         return tensor_parallel_pb2.ComputeResponse(output_tensor=output_tensor_proto)
 
 def serve():
     """
     Starts the gRPC server for this shard.
+    The servicer handles its own initialization including model and slice loading.
     """
-    # Load this shard's tensor slice before the server starts accepting requests.
-    # SHARD_ID and CONFIG_PATH are read from environment variables at the top of the file.
-    load_tensor_slice(SHARD_ID, CONFIG_PATH)
+    # Instantiate the servicer. Initialization (_initialize_shard) is called within its __init__.
+    # This will load the model and tensor slices based on ENV vars SHARD_ID and CONFIG_PATH.
+    try:
+        servicer = TensorParallelServiceServicer()
+    except Exception as e:
+        # If servicer initialization fails (e.g., model loading, config error),
+        # the shard cannot start. Log the error and exit.
+        # The specific error should have been printed by _initialize_shard.
+        print(f"CRITICAL: Shard failed to initialize servicer: {e}. Exiting.")
+        return # Exit if servicer setup fails
 
-    # Create a gRPC server with a thread pool for handling requests.
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-
-    # Add the implemented servicer (TensorParallelServiceServicer) to the server.
     tensor_parallel_pb2_grpc.add_TensorParallelServiceServicer_to_server(
-        TensorParallelServiceServicer(), server
+        servicer, server
     )
 
-    # Determine the port for this shard.
-    # It reads the main config file and finds the port associated with its SHARD_ID.
-    port = "50051" # Default port if not found in config or if config is malformed.
-    try:
-        with open(CONFIG_PATH, 'r') as f:
-            config_data = json.load(f) # List of shard configurations
+    # Get port from the servicer's loaded shard_config.
+    # Use a default if somehow not set, though _initialize_shard should ensure shard_config.
+    port_str = "50051" # Default port
+    if servicer.shard_config and "port" in servicer.shard_config:
+        port_str = str(servicer.shard_config["port"])
+    else:
+        print(f"Warning: Shard {servicer.shard_id} - port not found in config, using default {port_str}. This might be an issue if shard_config was not loaded correctly.")
 
-        # Find this shard's specific configuration dict
-        shard_config = next((s_conf for s_conf in config_data if s_conf["shard_id"] == SHARD_ID), None)
-
-        if shard_config and "port" in shard_config:
-            port = str(shard_config["port"])
-        else:
-            print(f"Warning: Port not found for shard {SHARD_ID} in {CONFIG_PATH}, using default port {port}.")
-    except Exception as e:
-        print(f"Error reading port from config file {CONFIG_PATH} for shard {SHARD_ID}: {e}. Using default port {port}.")
-
-    # Start the server on the determined port. '[::]' means listen on all available IPv6 and IPv4 interfaces.
-    server.add_insecure_port(f"[::]:{port}")
-    print(f"Shard {SHARD_ID} server starting on port {port}...")
+    server.add_insecure_port(f"[::]:{port_str}")
+    print(f"Shard {servicer.shard_id} server starting on port {port_str}...")
     server.start()
-    print(f"Shard {SHARD_ID} server started successfully on port {port}. Awaiting requests.")
+    print(f"Shard {servicer.shard_id} server started successfully on port {port_str}. Awaiting requests.")
 
-    # Keep the server running indefinitely (or until interrupted).
     try:
         while True:
-            time.sleep(86400)  # Sleep for one day (in seconds)
+            time.sleep(86400)  # Keep main thread alive
     except KeyboardInterrupt:
-        # Handle graceful shutdown on Ctrl+C
-        print(f"Shard {SHARD_ID} server stopping due to keyboard interrupt...")
-        server.stop(0) # 0 is grace period in seconds
-        print(f"Shard {SHARD_ID} server stopped.")
+        print(f"Shard {servicer.shard_id} server stopping due to keyboard interrupt...")
+        server.stop(0) # Graceful shutdown
+        print(f"Shard {servicer.shard_id} server stopped.")
 
 if __name__ == "__main__":
-    # This block executes when the script is run directly (e.g., `python shard.py`)
     serve()

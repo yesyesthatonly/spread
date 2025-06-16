@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x15tensor_parallel.proto\x12\x0ftensor_parallel\"$\n\x06Tensor\x12\x0c\n\x04\x64ims\x18\x01 \x03(\x03\x12\x0c\n\x04\x64\x61ta\x18\x02 \x03(\x02\"h\n\x0e\x43omputeRequest\x12-\n\x0cinput_tensor\x18\x01 \x01(\x0b\x32\x17.tensor_parallel.Tensor\x12\x12\n\nmodel_name\x18\x02 \x01(\t\x12\x13\n\x0btensor_name\x18\x03 \x01(\t\"A\n\x0f\x43omputeResponse\x12.\n\routput_tensor\x18\x01 \x01(\x0b\x32\x17.tensor_parallel.Tensor2k\n\x15TensorParallelService\x12R\n\rComputeMatMul\x12\x1f.tensor_parallel.ComputeRequest\x1a .tensor_parallel.ComputeResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x15tensor_parallel.proto\x12\x0ftensor_parallel\">\n\x06Tensor\x12\x0c\n\x04\x64ims\x18\x01 \x03(\x03\x12\x17\n\x0fserialized_data\x18\x03 \x01(\x0c\x12\r\n\x05\x64type\x18\x04 \x01(\t\"h\n\x0e\x43omputeRequest\x12-\n\x0cinput_tensor\x18\x01 \x01(\x0b\x32\x17.tensor_parallel.Tensor\x12\x12\n\nmodel_name\x18\x02 \x01(\t\x12\x13\n\x0btensor_name\x18\x03 \x01(\t\"A\n\x0f\x43omputeResponse\x12.\n\routput_tensor\x18\x01 \x01(\x0b\x32\x17.tensor_parallel.Tensor2k\n\x15TensorParallelService\x12R\n\rComputeMatMul\x12\x1f.tensor_parallel.ComputeRequest\x1a .tensor_parallel.ComputeResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -32,11 +32,11 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'tensor_parallel_pb2', _glob
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_TENSOR']._serialized_start=42
-  _globals['_TENSOR']._serialized_end=78
-  _globals['_COMPUTEREQUEST']._serialized_start=80
-  _globals['_COMPUTEREQUEST']._serialized_end=184
-  _globals['_COMPUTERESPONSE']._serialized_start=186
-  _globals['_COMPUTERESPONSE']._serialized_end=251
-  _globals['_TENSORPARALLELSERVICE']._serialized_start=253
-  _globals['_TENSORPARALLELSERVICE']._serialized_end=360
+  _globals['_TENSOR']._serialized_end=104
+  _globals['_COMPUTEREQUEST']._serialized_start=106
+  _globals['_COMPUTEREQUEST']._serialized_end=210
+  _globals['_COMPUTERESPONSE']._serialized_start=212
+  _globals['_COMPUTERESPONSE']._serialized_end=277
+  _globals['_TENSORPARALLELSERVICE']._serialized_start=279
+  _globals['_TENSORPARALLELSERVICE']._serialized_end=386
 # @@protoc_insertion_point(module_scope)

@@ -1,5 +1,4 @@
 grpcio>=1.50.0
 numpy>=1.20.0
-# Add transformers and torch when actual model loading and tokenization are implemented
-# transformers
-# torch
+transformers>=4.20.0
+torch>=1.10.0
