@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package tensor_parallel;
+
+// Service for tensor parallel computation
+service TensorParallelService {
+  // Computes a matrix multiplication slice
+  rpc ComputeMatMul(ComputeRequest) returns (ComputeResponse);
+}
+
+// Represents a tensor
+message Tensor {
+  repeated int64 dims = 1; // Dimensions of the tensor (e.g., [rows, cols])
+  repeated float data = 2;  // Flattened tensor data (row-major)
+  // For very large tensors, consider using bytes and serializing with a library like numpy/pytorch
+  // bytes serialized_data = 3;
+}
+
+// Request for matrix multiplication
+message ComputeRequest {
+  Tensor input_tensor = 1;
+  string model_name = 2; // Optional: if shards need to know which model's weights to use
+  string tensor_name = 3; // Optional: if shards manage multiple tensors/layers
+}
+
+// Response for matrix multiplication
+message ComputeResponse {
+  Tensor output_tensor = 1;
+}

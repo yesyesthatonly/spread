@@ -1,0 +1,18 @@
+[
+  {
+    "shard_id": "shard0",
+    "ip": "localhost",
+    "port": 50051,
+    "slice_start": 0,
+    "slice_end": 50,
+    "axis": "columns"
+  },
+  {
+    "shard_id": "shard1",
+    "ip": "localhost",
+    "port": 50052,
+    "slice_start": 50,
+    "slice_end": 100,
+    "axis": "columns"
+  }
+]

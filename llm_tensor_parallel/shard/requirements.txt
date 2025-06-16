@@ -1,0 +1,5 @@
+grpcio>=1.50.0
+numpy>=1.20.0
+# Add transformers and torch when actual model loading is implemented
+# transformers
+# torch
